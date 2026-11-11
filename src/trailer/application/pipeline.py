@@ -31,6 +31,7 @@ from trailer.domain.models import (
 )
 from trailer.editing.ffmpeg_editor import FFmpegEditor
 from trailer.observability.tracing import trace_span
+from trailer.observability.usage import TRACKER
 from trailer.sources.base import VideoSource
 from trailer.transcription.base import TranscriptProvider
 from trailer.validation.trailer_validator import TrailerValidator
@@ -96,77 +97,85 @@ class Pipeline:
                 "language": self._settings.language,
             },
         ) as span:
-            logger.info("Запуск конвейера: %s", url)
-            if self._rerun:
-                logger.info("Этапы к пересчёту: %s", ", ".join(sorted(self._rerun)))
+            try:
+                return self._run_pipeline(span, url)
+            finally:
+                totals = TRACKER.totals()
+                logger.info("Токены LLM за прогон: %s", totals.summary())
+                span.update(metadata={"token_totals": totals.as_dict()})
 
-            info = self._stage_fetch_info(url)
-            workspace = Workspace(self._settings.workspace_dir / f"video_{info.video_id}")
-            workspace.ensure_directories()
-            self._attach_file_logging(workspace)
+    def _run_pipeline(self, span: Any, url: str) -> Path:
+        logger.info("Запуск конвейера: %s", url)
+        if self._rerun:
+            logger.info("Этапы к пересчёту: %s", ", ".join(sorted(self._rerun)))
 
-            self._stage_download(url, workspace, info)
-            transcript = self._stage_model(
-                "transcript",
-                workspace.raw_transcript,
-                Transcript,
-                lambda: self._transcripts.fetch(info.video_id, self._settings.language),
-            )
-            prepared = self._stage_model(
-                "prepare",
-                workspace.prepared_transcript,
-                PreparedTranscript,
-                lambda: TranscriptPreprocessor().prepare(transcript),
-            )
-            blocks = self._stage(
-                "segment",
-                workspace.blocks,
-                compute=lambda: TranscriptSegmenter(self._settings.blocks).segment(prepared),
-                load=lambda path: [
-                    TranscriptBlock.model_validate(item) for item in _read_json(path)["blocks"]
-                ],
-                dump=lambda path, value: _save_json(
-                    path, {"blocks": [block.model_dump(mode="json") for block in value]}
-                ),
-            )
-            analyses = self._stage(
-                "analyze",
-                workspace.block_analysis,
-                compute=lambda: BlockAnalyzer(self._llm).analyze_all(blocks),
-                load=lambda path: [
-                    BlockAnalysis.model_validate(item) for item in _read_json(path)["analyses"]
-                ],
-                dump=lambda path, value: _save_json(
-                    path, {"analyses": [analysis.model_dump(mode="json") for analysis in value]}
-                ),
-            )
-            content_map = self._stage_model(
-                "map",
-                workspace.content_map,
-                ContentMap,
-                lambda: ContentMapper(self._llm).build_map(analyses),
-            )
-            selection = self._stage(
-                "select",
-                workspace.candidates,
-                compute=lambda: CandidateSelector(
-                    self._settings.selection, self._settings.target_duration, transcript
-                ).select(analyses),
-                load=_load_selection,
-                dump=_dump_selection,
-            )
-            script = self._stage_model(
-                "plan",
-                workspace.script,
-                TrailerScript,
-                lambda: TrailerPlanner(self._llm, self._settings).build_script(
-                    content_map, selection.accepted
-                ),
-            )
-            validated = self._stage_validate(workspace, script, transcript, prepared, info)
-            trailer = self._stage_render(workspace, validated)
-            span.update(output={"trailer": str(trailer), "video_id": info.video_id})
-            return trailer
+        info = self._stage_fetch_info(url)
+        workspace = Workspace(self._settings.workspace_dir / f"video_{info.video_id}")
+        workspace.ensure_directories()
+        self._attach_file_logging(workspace)
+
+        self._stage_download(url, workspace, info)
+        transcript = self._stage_model(
+            "transcript",
+            workspace.raw_transcript,
+            Transcript,
+            lambda: self._transcripts.fetch(info.video_id, self._settings.language),
+        )
+        prepared = self._stage_model(
+            "prepare",
+            workspace.prepared_transcript,
+            PreparedTranscript,
+            lambda: TranscriptPreprocessor().prepare(transcript),
+        )
+        blocks = self._stage(
+            "segment",
+            workspace.blocks,
+            compute=lambda: TranscriptSegmenter(self._settings.blocks).segment(prepared),
+            load=lambda path: [
+                TranscriptBlock.model_validate(item) for item in _read_json(path)["blocks"]
+            ],
+            dump=lambda path, value: _save_json(
+                path, {"blocks": [block.model_dump(mode="json") for block in value]}
+            ),
+        )
+        analyses = self._stage(
+            "analyze",
+            workspace.block_analysis,
+            compute=lambda: BlockAnalyzer(self._llm).analyze_all(blocks),
+            load=lambda path: [
+                BlockAnalysis.model_validate(item) for item in _read_json(path)["analyses"]
+            ],
+            dump=lambda path, value: _save_json(
+                path, {"analyses": [analysis.model_dump(mode="json") for analysis in value]}
+            ),
+        )
+        content_map = self._stage_model(
+            "map",
+            workspace.content_map,
+            ContentMap,
+            lambda: ContentMapper(self._llm).build_map(analyses),
+        )
+        selection = self._stage(
+            "select",
+            workspace.candidates,
+            compute=lambda: CandidateSelector(
+                self._settings.selection, self._settings.target_duration, transcript
+            ).select(analyses),
+            load=_load_selection,
+            dump=_dump_selection,
+        )
+        script = self._stage_model(
+            "plan",
+            workspace.script,
+            TrailerScript,
+            lambda: TrailerPlanner(self._llm, self._settings).build_script(
+                content_map, selection.accepted
+            ),
+        )
+        validated = self._stage_validate(workspace, script, transcript, prepared, info)
+        trailer = self._stage_render(workspace, validated)
+        span.update(output={"trailer": str(trailer), "video_id": info.video_id})
+        return trailer
 
     # ------------------------------------------------------------------ stages
 
@@ -250,6 +259,8 @@ class Pipeline:
                     for seg in script.segments
                 ],
                 "total_duration": sum(seg.duration for seg in script.segments),
+                "intro": self._resolve_intro(),
+                "transition_duration": self._settings.editing.transition_duration,
             },
             metadata={"cached": cached},
         ) as span:
@@ -259,7 +270,11 @@ class Pipeline:
                 return workspace.trailer_video
             if not workspace.original_video.exists():
                 raise SourceError("render", "Исходное видео не найдено в рабочей директории")
-            editor = FFmpegEditor(workspace.original_video)
+            editor = FFmpegEditor(
+                workspace.original_video,
+                intro_path=self._resolve_intro(),
+                transition_duration=self._settings.editing.transition_duration,
+            )
             trailer = editor.build_trailer(
                 script, workspace.trailer_video, workspace.trailer_segments_dir
             )
@@ -336,6 +351,16 @@ class Pipeline:
             return model.model_validate(_read_json(path))
 
         return self._stage(stage, artifact, compute, load, _save_model)
+
+    def _resolve_intro(self) -> Path | None:
+        intro_dir = self._settings.editing.intro_dir
+        if not intro_dir.is_dir():
+            return None
+        files = sorted(intro_dir.glob("*.mp4"))
+        if not files:
+            return None
+        logger.info("Интро найдено: %s", files[0])
+        return files[0]
 
     def _attach_file_logging(self, workspace: Workspace) -> None:
         root = logging.getLogger("trailer")

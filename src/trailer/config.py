@@ -51,6 +51,15 @@ class SelectionSettings(BaseModel):
     segment_padding: float = 0.4
 
 
+class EditingSettings(BaseModel):
+    """Parameters of the trailer assembly: intro and crossfades."""
+
+    # First *.mp4 in this directory (if any) is prepended to the trailer.
+    # The intro is not counted toward the target duration.
+    intro_dir: Path = Path("workspace/intro")
+    transition_duration: float = 0.5
+
+
 class TracingSettings(BaseSettings):
     """Langfuse tracing settings; read from standard ``LANGFUSE_*`` variables."""
 
@@ -91,6 +100,7 @@ class Settings(BaseSettings):
     blocks: BlockSettings = Field(default_factory=BlockSettings)
     download: DownloadSettings = Field(default_factory=DownloadSettings)
     selection: SelectionSettings = Field(default_factory=SelectionSettings)
+    editing: EditingSettings = Field(default_factory=EditingSettings)
 
     @property
     def duration_min(self) -> float:

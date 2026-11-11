@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 from trailer.config import TracingSettings
+from trailer.observability.usage import TRACKER
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,7 @@ def record_usage(observation: Any, usage: Any | None) -> None:
         details["total_tokens"] = total
     if details:
         observation.update(usage_details=details)
+    TRACKER.add(prompt, completion)
 
 
 def flush_tracing() -> None:
