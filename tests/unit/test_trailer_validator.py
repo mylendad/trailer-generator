@@ -94,6 +94,41 @@ class TestTrailerValidator:
         with pytest.raises(ScriptValidationError, match="вне допустимого диапазона"):
             validator.validate(script)
 
+    def test_no_error_between_max_and_hard_cap(self, settings):
+        validator = _validator(settings)
+        script = _script(
+            [
+                _seg(1, 5.0, 20.0),
+                _seg(2, 45.0, 60.0),
+                _seg(3, 105.0, 125.0),
+                _seg(4, 145.0, 165.0),
+            ]
+        )
+        result = validator.validate(script)
+        assert len(result.kept) == 4
+
+    def test_drops_last_fragment_when_over_hard_cap(self, tmp_path):
+        settings = Settings(
+            target_duration=50.0,
+            duration_tolerance=10.0,
+            max_allowed_duration=55.0,
+            workspace_dir=tmp_path,
+        )
+        validator = _validator(settings)
+        script = _script(
+            [
+                _seg(1, 5.0, 20.0),
+                _seg(2, 45.0, 60.0),
+                _seg(3, 105.0, 125.0),
+                _seg(4, 145.0, 165.0),
+            ]
+        )
+        result = validator.validate(script)
+        assert len(result.kept) == 3
+        assert result.total_duration <= 55.0
+        assert any("убран" in r for r in result.rejected)
+        assert [seg.order for seg in result.kept] == [1, 2, 3]
+
     def test_clamps_padding_to_video_bounds(self, settings):
         validator = _validator(settings)
         script = _script([_seg(1, 390.0, 400.0), _seg(2, 200.0, 215.0), _seg(3, 300.0, 315.0)])

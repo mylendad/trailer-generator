@@ -27,11 +27,12 @@ from trailer.domain.models import (
     Transcript,
     TranscriptBlock,
     TrailerScript,
+    TrailerSegment,
     VideoInfo,
 )
 from trailer.editing.ffmpeg_editor import FFmpegEditor
 from trailer.observability.tracing import trace_span
-from trailer.observability.usage import TRACKER
+from trailer.observability.usage import TRACKER, TokenTotals
 from trailer.sources.base import VideoSource
 from trailer.transcription.base import TranscriptProvider
 from trailer.validation.trailer_validator import TrailerValidator
@@ -72,6 +73,7 @@ class Pipeline:
         self._transcripts = transcripts
         self._llm = llm
         self._rerun: set[str] = set()
+        self.last_totals: TokenTotals | None = None
 
     def run(
         self,
@@ -101,6 +103,7 @@ class Pipeline:
                 return self._run_pipeline(span, url)
             finally:
                 totals = TRACKER.totals()
+                self.last_totals = totals
                 logger.info("Токены LLM за прогон: %s", totals.summary())
                 span.update(metadata={"token_totals": totals.as_dict()})
 
@@ -169,7 +172,7 @@ class Pipeline:
             workspace.script,
             TrailerScript,
             lambda: TrailerPlanner(self._llm, self._settings).build_script(
-                content_map, selection.accepted
+                content_map, selection.accepted, exclude=self._previous_script(workspace)
             ),
         )
         validated = self._stage_validate(workspace, script, transcript, prepared, info)
@@ -259,7 +262,8 @@ class Pipeline:
                     for seg in script.segments
                 ],
                 "total_duration": sum(seg.duration for seg in script.segments),
-                "intro": self._resolve_intro(),
+                "intro": self._resolve_media(self._settings.editing.intro_dir, "Интро найдено: %s"),
+                "outro": self._resolve_media(self._settings.editing.outro_dir, "Аутро найдено: %s"),
                 "transition_duration": self._settings.editing.transition_duration,
             },
             metadata={"cached": cached},
@@ -272,8 +276,14 @@ class Pipeline:
                 raise SourceError("render", "Исходное видео не найдено в рабочей директории")
             editor = FFmpegEditor(
                 workspace.original_video,
-                intro_path=self._resolve_intro(),
+                intro_path=self._resolve_media(
+                    self._settings.editing.intro_dir, "Интро найдено: %s"
+                ),
+                outro_path=self._resolve_media(
+                    self._settings.editing.outro_dir, "Аутро найдено: %s"
+                ),
                 transition_duration=self._settings.editing.transition_duration,
+                max_speech_extension=self._settings.selection.max_speech_extension,
             )
             trailer = editor.build_trailer(
                 script, workspace.trailer_video, workspace.trailer_segments_dir
@@ -352,15 +362,24 @@ class Pipeline:
 
         return self._stage(stage, artifact, compute, load, _save_model)
 
-    def _resolve_intro(self) -> Path | None:
-        intro_dir = self._settings.editing.intro_dir
-        if not intro_dir.is_dir():
+    def _resolve_media(self, directory: Path, found_log: str) -> Path | None:
+        if not directory.is_dir():
             return None
-        files = sorted(intro_dir.glob("*.mp4"))
+        files = sorted(directory.glob("*.mp4"))
         if not files:
             return None
-        logger.info("Интро найдено: %s", files[0])
+        logger.info(found_log, files[0])
         return files[0]
+
+    def _previous_script(self, workspace: Workspace) -> list[TrailerSegment]:
+        """Segments of the cached script, so a re-plan can avoid repeating them."""
+        if not workspace.script.exists():
+            return []
+        try:
+            script = TrailerScript.model_validate(_read_json(workspace.script))
+        except Exception:  # noqa: BLE001 - a stale artifact must not break planning
+            return []
+        return list(script.segments)
 
     def _attach_file_logging(self, workspace: Workspace) -> None:
         root = logging.getLogger("trailer")

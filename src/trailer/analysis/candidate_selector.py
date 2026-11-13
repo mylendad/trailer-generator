@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import bisect
 import logging
 import re
 from dataclasses import dataclass
@@ -8,6 +7,7 @@ from difflib import SequenceMatcher
 
 from trailer.config import SelectionSettings
 from trailer.domain.models import BlockAnalysis, SegmentCandidate, Transcript
+from trailer.transcription.cue_bounds import CueBounds
 
 logger = logging.getLogger(__name__)
 
@@ -29,39 +29,6 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
 
 
-def _floor(points: list[float], value: float) -> float:
-    index = bisect.bisect_right(points, value + 1e-6) - 1
-    return points[index] if index >= 0 else value
-
-
-def _ceil(points: list[float], value: float) -> float:
-    index = bisect.bisect_left(points, value - 1e-6)
-    return points[index] if index < len(points) else value
-
-
-def _align_to_cues(
-    candidates: list[SegmentCandidate], transcript: Transcript
-) -> tuple[list[SegmentCandidate], int]:
-    """Snap LLM timecodes to real cue boundaries so cuts never land mid-cue."""
-    starts = sorted({entry.start for entry in transcript.entries})
-    ends = sorted({entry.end for entry in transcript.entries})
-    if not starts or not ends:
-        return candidates, 0
-    aligned: list[SegmentCandidate] = []
-    changed = 0
-    for candidate in candidates:
-        start = _floor(starts, candidate.start)
-        end = _ceil(ends, candidate.end)
-        if end - start < 1.0:
-            aligned.append(candidate)
-            continue
-        if abs(start - candidate.start) > 1e-6 or abs(end - candidate.end) > 1e-6:
-            changed += 1
-            candidate = candidate.model_copy(update={"start": start, "end": end})
-        aligned.append(candidate)
-    return aligned, changed
-
-
 class CandidateSelector:
     """Deterministic scoring, deduplication and pooling of LLM candidates.
 
@@ -79,11 +46,32 @@ class CandidateSelector:
         self._settings = settings
         self._target_duration = target_duration
         self._transcript = transcript
+        self._bounds = CueBounds.from_transcript(transcript)
+
+    def _align_to_cues(
+        self, candidates: list[SegmentCandidate]
+    ) -> tuple[list[SegmentCandidate], int]:
+        """Snap LLM timecodes to cue boundaries so cuts never land mid-word."""
+        if self._bounds is None:
+            return candidates, 0
+        aligned: list[SegmentCandidate] = []
+        changed = 0
+        for candidate in candidates:
+            start = self._bounds.snap_start(candidate.start)
+            end = self._bounds.snap_end(candidate.end)
+            if end - start < 1.0:
+                aligned.append(candidate)
+                continue
+            if abs(start - candidate.start) > 1e-6 or abs(end - candidate.end) > 1e-6:
+                changed += 1
+                candidate = candidate.model_copy(update={"start": start, "end": end})
+            aligned.append(candidate)
+        return aligned, changed
 
     def select(self, analyses: list[BlockAnalysis]) -> SelectionResult:
         candidates = [c for a in analyses for c in a.candidates]
         if self._transcript is not None:
-            candidates, changed = _align_to_cues(candidates, self._transcript)
+            candidates, changed = self._align_to_cues(candidates)
             logger.info(
                 "Границы кандидатов выровнены по репликам: %d из %d", changed, len(candidates)
             )

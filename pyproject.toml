@@ -13,6 +13,7 @@ dependencies = [
     "gigachat>=0.2.4",
     "imageio-ffmpeg>=0.8.1",
     "langfuse>=4.0",
+    "aiogram>=3.31,<4",
 ]
 
 [dependency-groups]

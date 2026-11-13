@@ -35,6 +35,8 @@ _ENCODE_FLAGS = (
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 _RESOLUTION_RE = re.compile(r"(\d{2,5})x(\d{2,5})")
 _FPS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*fps")
+_SILENCE_START_RE = re.compile(r"silence_start:\s*(-?\d+(?:\.\d+)?)")
+_SILENCE_END_RE = re.compile(r"silence_end:\s*(\d+(?:\.\d+)?)")
 
 
 def build_cut_command(
@@ -163,7 +165,8 @@ class FFmpegEditor:
     """Cuts source intervals, adds the intro and assembles the final MP4.
 
     The editor makes no content decisions: it blindly renders the validated
-    script it receives.
+    script it receives. It only fixes one mechanical defect: segment ends are
+    pulled forward to the next real speech pause so words are never clipped.
     """
 
     def __init__(
@@ -171,11 +174,15 @@ class FFmpegEditor:
         source: Path,
         *,
         intro_path: Path | None = None,
+        outro_path: Path | None = None,
         transition_duration: float = 0.5,
+        max_speech_extension: float = 10.0,
     ) -> None:
         self._source = source
         self._intro_path = intro_path
+        self._outro_path = outro_path
         self._transition = transition_duration
+        self._max_speech_extension = max_speech_extension
         ffmpeg = resolve_ffmpeg()
         if ffmpeg is None:
             raise EditingError(
@@ -189,56 +196,85 @@ class FFmpegEditor:
         workdir.mkdir(parents=True, exist_ok=True)
         output.parent.mkdir(parents=True, exist_ok=True)
 
+        silences = self._detect_silences(self._source)
+
         segment_files: list[Path] = []
         for segment in sorted(script.segments, key=lambda s: s.order):
+            start = self._speech_start_at(segment.start, silences)
+            end = self._speech_pause_after(segment.end, silences)
+            if start != segment.start:
+                logger.info(
+                    "Фрагмент %d: начало сдвинуто к паузе речи %.2f -> %.2f",
+                    segment.order,
+                    segment.start,
+                    start,
+                )
+            if end != segment.end:
+                logger.info(
+                    "Фрагмент %d: конец сдвинут к паузе речи %.2f -> %.2f",
+                    segment.order,
+                    segment.end,
+                    end,
+                )
             segment_path = (workdir / f"segment_{segment.order:02d}.mp4").resolve()
             command = build_cut_command(
                 self._source,
                 segment_path,
-                segment.start,
-                segment.end,
+                start,
+                end,
                 executable=self._ffmpeg,
             )
             self._run(command, f"нарезка фрагмента {segment.order}")
             segment_files.append(segment_path)
 
-        intro_file = self._prepare_intro(workdir)
+        intro_file = self._prepare_media(self._intro_path, workdir, "intro.mp4", "интро")
+        outro_file = self._prepare_media(self._outro_path, workdir, "outro.mp4", "аутро")
         if self._transition <= 0:
-            self._concat(intro_file, segment_files, output, workdir)
+            self._concat(intro_file, segment_files, outro_file, output, workdir)
         else:
-            self._crossfade(intro_file, segment_files, output)
+            self._crossfade(intro_file, segment_files, outro_file, output)
 
         if not output.exists() or output.stat().st_size == 0:
             raise EditingError(_STAGE, f"Итоговый файл не создан или пуст: {output}")
+        extras = [label for label, file in (("интро", intro_file), ("аутро", outro_file)) if file]
         logger.info(
             "Трейлер собран: %s (%.1f МБ, %d фрагментов%s)",
             output,
             output.stat().st_size / 1e6,
             len(segment_files),
-            ", с интро" if intro_file else "",
+            f", с {' и '.join(extras)}" if extras else "",
         )
         return output
 
     # ---------------------------------------------------------------- helpers
 
-    def _prepare_intro(self, workdir: Path) -> Path | None:
-        if self._intro_path is None:
+    def _prepare_media(
+        self, source: Path | None, workdir: Path, target_name: str, label: str
+    ) -> Path | None:
+        if source is None:
             return None
         width, height, fps = self._probe_stream(self._source)
-        normalized = workdir / "intro.mp4"
+        normalized = workdir / target_name
         self._run(
             build_normalize_command(
-                self._intro_path, normalized, width, height, fps, executable=self._ffmpeg
+                source, normalized, width, height, fps, executable=self._ffmpeg
             ),
-            "нормализация интро",
+            f"нормализация {label}",
         )
         return normalized
 
     def _concat(
-        self, intro_file: Path | None, segment_files: list[Path], output: Path, workdir: Path
+        self,
+        intro_file: Path | None,
+        segment_files: list[Path],
+        outro_file: Path | None,
+        output: Path,
+        workdir: Path,
     ) -> None:
         entries = [intro_file] if intro_file else []
         entries += segment_files
+        if outro_file:
+            entries.append(outro_file)
         list_file = workdir / "concat.txt"
         list_file.write_text(
             "\n".join(f"file '{path}'" for path in entries) + "\n",
@@ -249,12 +285,20 @@ class FFmpegEditor:
             "склейка трейлера",
         )
 
-    def _crossfade(self, intro_file: Path | None, segment_files: list[Path], output: Path) -> None:
+    def _crossfade(
+        self,
+        intro_file: Path | None,
+        segment_files: list[Path],
+        outro_file: Path | None,
+        output: Path,
+    ) -> None:
         clips: list[tuple[Path, float]] = []
         if intro_file is not None:
             clips.append((intro_file, self._probe_duration(intro_file)))
         for path in segment_files:
             clips.append((path, self._probe_duration(path)))
+        if outro_file is not None:
+            clips.append((outro_file, self._probe_duration(outro_file)))
         self._run(
             build_crossfade_command(clips, self._transition, output, executable=self._ffmpeg),
             "склейка трейлера с переходами",
@@ -292,6 +336,70 @@ class FFmpegEditor:
         except OSError as exc:
             raise EditingError(_STAGE, f"Не удалось запустить FFmpeg ({action}): {exc}") from exc
         return completed.stderr
+
+    def _detect_silences(self, path: Path) -> list[tuple[float, float]]:
+        """Real speech pauses of the source: (start, end) pairs of silences."""
+        try:
+            completed = subprocess.run(
+                [
+                    self._ffmpeg,
+                    "-i",
+                    str(path),
+                    "-af",
+                    "silencedetect=noise=-25dB:d=0.2",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise EditingError(
+                _STAGE, f"Не удалось запустить FFmpeg (детект тишины): {exc}"
+            ) from exc
+        stderr = completed.stderr
+        starts = [float(m) for m in _SILENCE_START_RE.findall(stderr)]
+        ends = [float(m) for m in _SILENCE_END_RE.findall(stderr)]
+        if not starts:
+            return []
+        if len(ends) < len(starts):  # trailing silence has no silence_end line
+            ends.append(starts[-1] + 1e9)
+        return list(zip(starts, ends))
+
+    def _speech_pause_after(self, end: float, silences: list[tuple[float, float]]) -> float:
+        """Move the cut to the start of the first real silence after ``end``.
+
+        If ``end`` already sits inside a silence (or no silence follows within
+        the allowed extension), the boundary is kept as is.
+        """
+        for silence_start, silence_end in silences:
+            if silence_start <= end <= silence_end:
+                return end
+        for silence_start, _silence_end in silences:
+            if silence_start >= end - 0.05:
+                if silence_start > end + self._max_speech_extension:
+                    return end
+                return max(end, silence_start)
+        return end
+
+    def _speech_start_at(self, start: float, silences: list[tuple[float, float]]) -> float:
+        """Drop a mid-speech fragment tail before ``start`` up to a speech pause.
+
+        A candidate that starts in the middle of the previous thought gets its
+        beginning moved forward to the moment speech resumes after the first
+        silence. If ``start`` already sits inside a silence, it is kept.
+        """
+        for silence_start, silence_end in silences:
+            if silence_start <= start <= silence_end:
+                return start
+        for _silence_start, silence_end in silences:
+            if silence_end >= start - 0.05:
+                if silence_end > start + self._max_speech_extension:
+                    return start
+                return max(start, silence_end)
+        return start
 
     def _run(self, command: list[str], action: str) -> None:
         logger.debug("Запуск: %s", " ".join(command))

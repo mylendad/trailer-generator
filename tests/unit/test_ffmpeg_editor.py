@@ -121,7 +121,8 @@ class TestFFmpegEditor:
         monkeypatch.setattr("trailer.editing.ffmpeg_editor.subprocess.run", fake_run)
         output = editor.build_trailer(self._script(), tmp_path / "trailer.mp4", tmp_path / "segs")
         assert output.exists()
-        assert len(calls) == 3  # 2 cuts + 1 concat
+        assert len(calls) == 4  # detect-silences + 2 cuts + 1 concat
+        assert calls[1][calls[1].index("-ss") + 1] == "1.000"
         assert calls[-1][calls[-1].index("-f") + 1] == "concat"
         concat_list = (tmp_path / "segs" / "concat.txt").read_text(encoding="utf-8")
         assert all(line.startswith("file '/") for line in concat_list.splitlines() if line)
@@ -151,15 +152,49 @@ class TestFFmpegEditor:
         monkeypatch.setattr("trailer.editing.ffmpeg_editor.subprocess.run", fake_run)
         output = editor.build_trailer(self._script(), tmp_path / "trailer.mp4", tmp_path / "segs")
         assert output.exists()
-        # 2 cuts + probe(source) + normalize + 3 probes (intro, seg1, seg2) + crossfade
-        assert len(calls) == 8
-        assert calls[0][calls[0].index("-ss") + 1] == "1.000"  # cuts go first
+        # detect-silences + 2 cuts + probe(source) + normalize + 3 probes + crossfade
+        assert len(calls) == 9
+        assert calls[0][calls[0].index("-af") + 1].startswith("silencedetect")
         normalize = next(c for c in calls if "-vf" in c)
         assert normalize[normalize.index("-vf") + 1].startswith("scale=1920:1080")
         final = calls[-1]
         assert "-filter_complex" in final
         filters = final[final.index("-filter_complex") + 1]
         assert "offset=12.510" in filters
+
+    def test_build_trailer_with_outro_crossfade(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        outro = tmp_path / "outro_raw.mp4"
+        outro.write_bytes(b"fake-outro")
+        editor = self._editor(tmp_path, monkeypatch, outro_path=outro, transition_duration=0.5)
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            Path(command[-1]).parent.mkdir(parents=True, exist_ok=True)
+            Path(command[-1]).write_bytes(b"data")
+
+            class Result:
+                returncode = 0
+                stderr = (
+                    "Duration: 00:00:08.00, start: 0.000000\n"
+                    "Stream #0:0: Video: h264, 1920x1080, 24 fps\n"
+                )
+
+            return Result()
+
+        monkeypatch.setattr("trailer.editing.ffmpeg_editor.subprocess.run", fake_run)
+        output = editor.build_trailer(self._script(), tmp_path / "trailer.mp4", tmp_path / "segs")
+        assert output.exists()
+        # detect + 2 cuts + probe(source) + normalize(outro) + probes + crossfade
+        normalize = next(c for c in calls if "-vf" in c)
+        assert normalize[normalize.index("-i") + 1].endswith("outro_raw.mp4")
+        final = calls[-1]
+        filters = final[final.index("-filter_complex") + 1]
+        # outro is the last input in the chain
+        assert final[final.index("-i") + 1].endswith("segs/segment_01.mp4")
+        assert "offset=" in filters
 
     def test_probe_duration_parses_stderr(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         editor = self._editor(tmp_path, monkeypatch)
@@ -173,6 +208,56 @@ class TestFFmpegEditor:
 
         monkeypatch.setattr("trailer.editing.ffmpeg_editor.subprocess.run", fake_run)
         assert editor._probe_duration(Path("x.mp4")) == 65.5
+
+    def test_detect_silences_parses_stderr(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        editor = self._editor(tmp_path, monkeypatch)
+
+        def fake_run(command, **kwargs):
+            class Result:
+                returncode = 0
+                stderr = (
+                    "[silencedetect @ 0x0] silence_start: 3442.95\n"
+                    "[silencedetect @ 0x0] silence_end: 3447.5 | silence_duration: 4.55\n"
+                    "[silencedetect @ 0x0] silence_start: 3500.1\n"
+                )
+
+            return Result()
+
+        monkeypatch.setattr("trailer.editing.ffmpeg_editor.subprocess.run", fake_run)
+        assert editor._detect_silences(Path("x.mp4")) == [(3442.95, 3447.5), (3500.1, 3500.1 + 1e9)]
+
+    def test_speech_pause_after_extends_to_next_silence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        editor = self._editor(tmp_path, monkeypatch)
+        silences = [(3442.95, 3447.5), (3455.0, 3456.0)]
+        assert editor._speech_pause_after(3436.28, silences) == pytest.approx(3442.95)
+        assert editor._speech_pause_after(3450.0, silences) == pytest.approx(3455.0)
+
+    def test_speech_pause_after_inside_silence_or_beyond_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        editor = self._editor(tmp_path, monkeypatch)
+        silences = [(3442.95, 3447.5)]
+        assert editor._speech_pause_after(3445.0, silences) == pytest.approx(3445.0)
+        assert editor._speech_pause_after(3440.0, silences) == pytest.approx(3442.95)
+        # No silence within the extension cap -> keep the boundary.
+        assert editor._speech_pause_after(3999.0, silences) == pytest.approx(3999.0)
+
+    def test_speech_start_at_trims_tail_to_pause(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        editor = self._editor(tmp_path, monkeypatch)
+        silences = [(3430.0, 3430.5), (3440.0, 3442.0)]
+        # start sits inside a silence -> kept
+        assert editor._speech_start_at(3441.0, silences) == pytest.approx(3441.0)
+        # start is mid-speech: the tail before the pause is dropped, speech
+        # resumes at the silence end
+        assert editor._speech_start_at(3435.5, silences) == pytest.approx(3442.0)
+        # the first resume point is beyond the cap -> keep the boundary
+        assert editor._speech_start_at(3431.5, silences) == pytest.approx(3431.5)
+        # no silence after start at all -> keep
+        assert editor._speech_start_at(3500.0, silences) == pytest.approx(3500.0)
 
     def test_ffmpeg_failure_raises_with_stderr(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

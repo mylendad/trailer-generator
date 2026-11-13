@@ -46,18 +46,36 @@ class SelectionSettings(BaseModel):
 
     candidate_pool_factor: float = 4.0
     min_candidate_duration: float = 5.0
-    max_candidate_duration: float = 40.0
+    max_candidate_duration: float = 50.0
     dedupe_similarity: float = 0.6
     segment_padding: float = 0.4
+    # The editor may pull a segment end forward to the next real speech pause
+    # (ffmpeg silencedetect), but never by more than this many seconds.
+    max_speech_extension: float = 10.0
 
 
 class EditingSettings(BaseModel):
-    """Parameters of the trailer assembly: intro and crossfades."""
+    """Parameters of the trailer assembly: intro, outro and crossfades."""
 
-    # First *.mp4 in this directory (if any) is prepended to the trailer.
-    # The intro is not counted toward the target duration.
+    # First *.mp4 in these directories (if any) is prepended/appended.
+    # They are not counted toward the target duration.
     intro_dir: Path = Path("workspace/intro")
+    outro_dir: Path = Path("workspace/outro")
     transition_duration: float = 0.5
+
+
+class TelegramBotSettings(BaseModel):
+    """Settings of the Telegram bot integration.
+
+    Bot API cannot download files larger than 20 MB from users.
+    """
+
+    bot_token: SecretStr | None = None
+    intro_templates_dir: Path = Path("workspace/intro_templates")
+    outro_templates_dir: Path = Path("workspace/outro_templates")
+    active_intro_dir: Path = Path("workspace/intro")
+    active_outro_dir: Path = Path("workspace/outro")
+    max_intro_mb: float = 20.0
 
 
 class TracingSettings(BaseSettings):
@@ -92,8 +110,9 @@ class Settings(BaseSettings):
 
     url: str | None = None
     language: str = "ru"
-    target_duration: float = 90.0
-    duration_tolerance: float = 10.0
+    target_duration: float = 150.0
+    duration_tolerance: float = 30.0
+    max_allowed_duration: float = 240.0
     workspace_dir: Path = Path("workspace")
 
     llm: LLMSettings = Field(default_factory=LLMSettings)
@@ -101,6 +120,7 @@ class Settings(BaseSettings):
     download: DownloadSettings = Field(default_factory=DownloadSettings)
     selection: SelectionSettings = Field(default_factory=SelectionSettings)
     editing: EditingSettings = Field(default_factory=EditingSettings)
+    telegram: TelegramBotSettings = Field(default_factory=TelegramBotSettings)
 
     @property
     def duration_min(self) -> float:

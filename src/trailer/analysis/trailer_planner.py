@@ -6,7 +6,7 @@ import logging
 from trailer.analysis.llm.base import LLMClient
 from trailer.analysis.prompts import load_prompt
 from trailer.config import Settings
-from trailer.domain.models import ContentMap, SegmentCandidate, TrailerScript
+from trailer.domain.models import ContentMap, SegmentCandidate, TrailerScript, TrailerSegment
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ class TrailerPlanner:
         self,
         content_map: ContentMap,
         candidates: list[SegmentCandidate],
+        exclude: list[TrailerSegment] | None = None,
     ) -> TrailerScript:
         if not candidates:
             raise ValueError("Нет кандидатов для формирования сценария")
@@ -40,6 +41,12 @@ class TrailerPlanner:
             f"Целевая длительность трейлера: {self._settings.target_duration} секунд "
             f"(допустимо ±{self._settings.duration_tolerance} секунд)."
         )
+        if exclude:
+            user_prompt += (
+                "\n\nУже использованные фрагменты (это другой вариант трейлера того же "
+                "видео; НЕ выбирайте эти интервалы и близкие к ним по смыслу идеи):\n"
+                f"{json.dumps([s.model_dump(mode='json') for s in exclude], ensure_ascii=False, indent=1)}"
+            )
         script = self._llm.complete_json(system_prompt, user_prompt, TrailerScript)
         script = self._fit_to_target(script)
         logger.info(

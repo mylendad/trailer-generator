@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import bisect
 import logging
 from dataclasses import dataclass, field
 
@@ -12,6 +11,7 @@ from trailer.domain.models import (
     TrailerScript,
     TrailerSegment,
 )
+from trailer.transcription.cue_bounds import CueBounds
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +33,11 @@ class TrailerValidator:
     """Checks an LLM-produced script against the source data before editing.
 
     Every interval must be inside the video, must be backed by real transcript
-    utterances, must not duplicate another interval, and the total duration
-    must fit the configured window. Intervals are snapped to utterance
-    boundaries with a small padding so speech is not clipped mid-word.
+    utterances, and must not duplicate another interval. The total duration
+    must not fall below the configured minimum; when it exceeds the hard cap
+    (``max_allowed_duration``), trailing fragments are dropped instead of
+    failing. Intervals are snapped to utterance boundaries with a small
+    padding so speech is not clipped mid-word.
     """
 
     def __init__(
@@ -48,8 +50,7 @@ class TrailerValidator:
         self._settings = settings
         self._prepared = prepared
         self._video_duration = video_duration
-        self._cue_starts = sorted({e.start for e in raw.entries}) if raw is not None else []
-        self._cue_ends = sorted({e.end for e in raw.entries}) if raw is not None else []
+        self._bounds = CueBounds.from_transcript(raw)
 
     def validate(self, script: TrailerScript) -> ValidationResult:
         result = ValidationResult()
@@ -83,19 +84,32 @@ class TrailerValidator:
             seen_ranges.append((snapped.start, snapped.end))
             result.kept.append(snapped)
 
-        result.kept = [
-            seg.model_copy(update={"order": i}) for i, seg in enumerate(result.kept, start=1)
-        ]
-
         if not result.kept:
             raise ScriptValidationError(
                 _STAGE, "Все фрагменты сценария отклонены: " + "; ".join(result.rejected)
             )
-        if not self._settings.duration_min <= result.total_duration <= self._settings.duration_max:
+
+        max_allowed = self._settings.max_allowed_duration
+        while result.kept and result.total_duration > max_allowed:
+            dropped = result.kept.pop()
+            result.rejected.append(
+                f"Фрагмент {dropped.order}: убран, итоговая длительность превышает лимит "
+                f"{max_allowed:.0f} с"
+            )
+        if not result.kept:
+            raise ScriptValidationError(
+                _STAGE, "Все фрагменты сценария отклонены: " + "; ".join(result.rejected)
+            )
+
+        result.kept = [
+            seg.model_copy(update={"order": i}) for i, seg in enumerate(result.kept, start=1)
+        ]
+
+        if result.total_duration < self._settings.duration_min:
             raise ScriptValidationError(
                 _STAGE,
                 f"Итоговая длительность {result.total_duration:.1f} с вне допустимого диапазона "
-                f"{self._settings.duration_min:.0f}–{self._settings.duration_max:.0f} с "
+                f"меньше минимальной {self._settings.duration_min:.0f} с "
                 f"({len(result.kept)} фрагментов)",
             )
         logger.info(
@@ -133,14 +147,11 @@ class TrailerValidator:
         return None
 
     def _align_to_cues(self, segment: TrailerSegment) -> TrailerSegment:
-        """Expand borders to the enclosing subtitle cues so speech is never cut."""
-        if not self._cue_starts or not self._cue_ends:
+        """Snap borders to the enclosing subtitle cues and speech pauses."""
+        if self._bounds is None:
             return segment
-        start_index = bisect.bisect_right(self._cue_starts, segment.start + 1e-6) - 1
-        end_index = bisect.bisect_left(self._cue_ends, segment.end - 1e-6)
-        start = self._cue_starts[start_index] if start_index >= 0 else segment.start
-        end = self._cue_ends[end_index] if end_index < len(self._cue_ends) else segment.end
-        end = min(end, self._video_duration)
+        start = self._bounds.snap_start(segment.start)
+        end = min(self._bounds.snap_end(segment.end), self._video_duration)
         if end - start < 1.0:
             return segment
         if abs(start - segment.start) < 1e-6 and abs(end - segment.end) < 1e-6:
